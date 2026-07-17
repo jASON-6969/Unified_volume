@@ -18,7 +18,7 @@ A lightweight Windows desktop app that captures system audio via WASAPI loopback
 
 ```bash
 # 1. Clone the repo
-git clone [<repo-url>](https://github.com/jASON-6969/Unified_volume.git)
+git clone https://github.com/jASON-6969/Unified_volume.git
 cd Unified_volume
 
 # 2. Install dependencies
