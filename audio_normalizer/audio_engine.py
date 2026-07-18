@@ -76,7 +76,7 @@ class AudioEngine:
         return devices
 
     def get_output_devices(self) -> list[dict]:
-        """回傳所有輸出裝置清單（包含 VB-Cable）。"""
+        """回傳所有 WASAPI 輸出裝置清單（包含 VB-Cable）。"""
         if not self._pa:
             return []
         devices = []
@@ -84,11 +84,12 @@ class AudioEngine:
             wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
             wasapi_index = wasapi_info["index"]
         except OSError:
-            wasapi_index = -1
+            return []
 
         for i in range(self._pa.get_device_count()):
             dev = self._pa.get_device_info_by_index(i)
-            if dev.get("maxOutputChannels") > 0:
+            # Bug 3 fix: 只列 WASAPI 裝置，避免與 WASAPI loopback 輸入混用造成開流失敗
+            if dev.get("hostApi") == wasapi_index and dev.get("maxOutputChannels") > 0:
                 tag = ""
                 if "VB-Audio" in dev["name"] or "CABLE" in dev["name"].upper():
                     tag = " [VB-Cable]"
@@ -128,9 +129,17 @@ class AudioEngine:
 
         self.loopback_device_index = loopback_index
         self.output_device_index = output_index
+        # Bug 2 fix: 用 Event 等待 thread 確認串流開啟成功或失敗
+        self._start_event = threading.Event()
+        self._start_error: str | None = None
         self._running = True
         self._thread = threading.Thread(target=self._audio_loop, daemon=True)
         self._thread.start()
+        # 最多等 3 秒讓 thread 完成 pa.open()
+        self._start_event.wait(timeout=3)
+        if self._start_error is not None:
+            self._running = False
+            raise RuntimeError(self._start_error)
 
     def stop(self):
         self._running = False
@@ -146,14 +155,24 @@ class AudioEngine:
         pa = self._pa
 
         loopback_dev = pa.get_device_info_by_index(self.loopback_device_index)
-        rate = int(loopback_dev.get("defaultSampleRate", self.RATE))
+        output_dev = pa.get_device_info_by_index(self.output_device_index)
+
         channels = min(int(loopback_dev.get("maxInputChannels", 2)), 2)
+
+        # 各自用裝置 native rate，rate 不同時做 resample
+        in_rate  = int(loopback_dev.get("defaultSampleRate", self.RATE))
+        out_rate = int(output_dev.get("defaultSampleRate", self.RATE))
+
+        # 增益平滑係數基於輸入 rate
+        attack_coeff  = 1.0 - np.exp(-self.CHUNK / (in_rate * 0.050))
+        release_coeff = 1.0 - np.exp(-self.CHUNK / (in_rate * 0.300))
+        smooth_gain = 1.0
 
         try:
             stream_in = pa.open(
                 format=pyaudio.paFloat32,
                 channels=channels,
-                rate=rate,
+                rate=in_rate,
                 input=True,
                 input_device_index=self.loopback_device_index,
                 frames_per_buffer=self.CHUNK,
@@ -161,19 +180,23 @@ class AudioEngine:
             stream_out = pa.open(
                 format=pyaudio.paFloat32,
                 channels=channels,
-                rate=rate,
+                rate=out_rate,
                 output=True,
                 output_device_index=self.output_device_index,
                 frames_per_buffer=self.CHUNK,
             )
         except Exception as e:
             self._running = False
-            # push error signal via meter queue
+            self._start_error = str(e)
+            self._start_event.set()  # Bug 2 fix: 通知 start() 開流失敗
             try:
                 self.meter_queue.put_nowait(("error", str(e)))
             except queue.Full:
                 pass
             return
+
+        # Bug 2 fix: 通知 start() 開流成功
+        self._start_event.set()
 
         while self._running:
             try:
@@ -185,22 +208,44 @@ class AudioEngine:
 
                 if not self._bypass:
                     if in_rms > 1e-6:
-                        gain = self._target_linear / in_rms
-                        # 防止增益過大造成爆音（最多放大 +20dB）
-                        gain = min(gain, db_to_linear(20.0))
-                        normalized = samples * gain
-                        # 最終 hard clip 防止超過 0dBFS
-                        normalized = np.clip(normalized, -1.0, 1.0)
+                        target_gain = self._target_linear / in_rms
+                        # 最多放大 +12dB，降低爆音風險
+                        target_gain = min(target_gain, db_to_linear(12.0))
                     else:
-                        # 靜音時直接輸出靜音
-                        normalized = samples
-                    clipped = normalized
+                        target_gain = smooth_gain  # 靜音時維持現有增益，不跳變
+
+                    # 增益平滑：上升用 attack，下降用 release
+                    if target_gain < smooth_gain:
+                        smooth_gain = smooth_gain + attack_coeff * (target_gain - smooth_gain)
+                    else:
+                        smooth_gain = smooth_gain + release_coeff * (target_gain - smooth_gain)
+
+                    normalized = samples * smooth_gain
+
+                    # soft knee limiter：用 tanh 替代 hard clip，避免截斷失真
+                    # tanh(x) 在 |x| < 0.9 幾乎線性，超過才平滑壓縮至 [-1, 1]
+                    clipped = np.tanh(normalized)
                 else:
                     clipped = samples
 
                 out_rms = float(np.sqrt(np.mean(clipped ** 2)))
                 out_db = linear_to_db(out_rms)
                 gr_db = out_db - in_db  # gain reduction (negative = reducing)
+
+                # rate 不同時做線性 resample（48000→44100 等）
+                if in_rate != out_rate:
+                    total_in  = len(clipped)
+                    # clipped 是 interleaved，共 total_in/channels 個 frame
+                    n_frames_in  = total_in // channels
+                    n_frames_out = int(round(n_frames_in * out_rate / in_rate))
+                    # reshape 成 (frames, channels)，每聲道獨立插值，再 flatten
+                    arr = clipped.reshape(n_frames_in, channels)
+                    x_in  = np.linspace(0, 1, n_frames_in,  endpoint=False)
+                    x_out = np.linspace(0, 1, n_frames_out, endpoint=False)
+                    resampled = np.empty((n_frames_out, channels), dtype=np.float32)
+                    for ch in range(channels):
+                        resampled[:, ch] = np.interp(x_out, x_in, arr[:, ch])
+                    clipped = resampled.flatten()
 
                 stream_out.write(clipped.tobytes())
 

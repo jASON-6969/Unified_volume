@@ -191,16 +191,16 @@ class MainWindow(QMainWindow):
         lim_layout.addLayout(threshold_row)
 
         self.slider_threshold = QSlider(Qt.Orientation.Horizontal)
-        self.slider_threshold.setMinimum(-400)   # -40.0 dB
+        self.slider_threshold.setMinimum(-600)   # -60.0 dB
         self.slider_threshold.setMaximum(0)       # 0.0 dB
         self.slider_threshold.setValue(-100)      # -10.0 dB default
-        self.slider_threshold.setTickInterval(50)
+        self.slider_threshold.setTickInterval(100)
         self.slider_threshold.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.slider_threshold.valueChanged.connect(self._on_threshold_changed)
         lim_layout.addWidget(self.slider_threshold)
 
         tick_row = QHBoxLayout()
-        for lbl_text in ["-40", "-35", "-30", "-25", "-20", "-15", "-10", "-5", "0"]:
+        for lbl_text in ["-60", "-50", "-40", "-30", "-20", "-10", "0"]:
             lbl = QLabel(lbl_text)
             lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             lbl.setStyleSheet("font-size: 9px; color: #888;")
@@ -286,9 +286,10 @@ class MainWindow(QMainWindow):
             self.combo_output.addItem(self._t("no_output_device"), -1)
         else:
             for d in outputs:
-                # skip loopback devices and CABLE Input from output list
+                # skip loopback devices and VB-Cable Input from output list
+                # Bug 4 fix: 原條件 "CABLE IN 1" 無法匹配實際裝置名 "CABLE Input"
                 name_up = d["name"].upper()
-                if "LOOPBACK" in name_up or "CABLE IN 1" in name_up:
+                if "LOOPBACK" in name_up or "CABLE INPUT" in name_up:
                     continue
                 self.combo_output.addItem(d["name"], d["index"])
 
